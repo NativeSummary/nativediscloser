@@ -12,6 +12,7 @@ import pydot
 import networkx as nx
 import logging
 from androguard.misc import AnalyzeAPK
+import json, time
 
 from import_implementations import hookAllImportSymbols
 from jni_interfaces.record import Record
@@ -22,10 +23,13 @@ from jni_interfaces.utils import (record_static_jni_functions, clean_records,
 ANGR_RETDEC_OFFSET = 4194305
 
 # the longest time in seconds to analyze 1 JNI function.
-WAIT_TIME = 180
+WAIT_TIME = int(os.getenv("WAIT_TIME", '180'))
+if WAIT_TIME != 180:
+    print("WAIT_TIME="+str(WAIT_TIME))
 # the longest time in seconds for dynamic registration analysis
-DYNAMIC_ANALYSIS_TIME = 600
-
+DYNAMIC_ANALYSIS_TIME = int(os.getenv("DYNAMIC_ANALYSIS_TIME", '600'))
+if DYNAMIC_ANALYSIS_TIME != 600:
+    print("DYNAMIC_ANALYSIS_TIME="+str(DYNAMIC_ANALYSIS_TIME))
 # Directory for different ABIs, refer to: https://developer.android.com/ndk/guides/abis
 ABI_DIRS = ['lib/armeabi-v7a/', 'lib/armeabi/', 'lib/arm64-v8a/', 'lib/x86/', 'lib/x86_64/']
 FDROID_DIR = '../fdroid_crawler'
@@ -337,6 +341,8 @@ def apk_run(path, out=None, output_cg=False, comprise=False):
             if n.endswith('.so') and n.startswith(chosen_abi_dir):
                 logger.debug(f'Start to analyze {n}')
                 so_file = zf.extract(n, path=tmpd)
+                coverage_info = {'__jucify_abi_dir__':chosen_abi_dir}
+                logp = os.path.join(out, n.split('/')[-1]+'.cov.json')
                 with mp.Manager() as mgr:
                     returns = mgr.dict()
                     proj, jvm, jenv, dynamic_timeout = find_all_jni_functions(so_file, dex)
@@ -355,22 +361,33 @@ def apk_run(path, out=None, output_cg=False, comprise=False):
                         'func_stack': mgr.list()
                     }
                     perf.add_analyzed_so()
+                    print("Start Analyzing each jni method")
                     for jni_func, record in Record.RECORDS.items():
                         # clear func stack before each analysis
                         global_refs.get('func_stack')[:] = list()
                         # wrap the analysis with its own process to limit the
                         # analysis time.
+                        coverage = mgr.dict()
+                        jni_start_time = time.time()
                         p = mp.Process(target=analyze_jni_function,
-                                args=(*(jni_func, proj, jvm, jenv, dex, returns, global_refs),))
+                                args=(*(jni_func, proj, jvm, jenv, dex, returns, global_refs, coverage),))
                         p.start()
                         perf.add_analyzed_func()
                         # For analysis of each .so file, we wait for 3mins at most.
+                        timeout = False
                         p.join(WAIT_TIME)
                         if p.is_alive():
                             perf.add_timeout()
-                            p.terminate()
+                            timeout = True
+                            p.kill()
                             p.join()
                             logger.warning(f'Timeout when analyzing {n}')
+                        coverage_info[str(record)] = {'coverage':list(coverage.keys()), 'time': time.time()-jni_start_time, 'timeout': timeout}
+                        with open(logp, 'w') as f:
+                            json.dump(coverage_info, f, indent=2)
+                    logger.info("output log: "+logp)
+                    with open(logp, 'w') as f:
+                        json.dump(coverage_info, f, indent=2)
                     for addr, invokees in returns.items():
                         record = Record.RECORDS.get(addr)
                         for invokee in invokees:

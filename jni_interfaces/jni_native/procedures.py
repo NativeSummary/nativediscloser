@@ -123,6 +123,7 @@ class CallMethodBase(JPB):
                         f'{method_ptr} without corresponding method instance')
             else:
                 cur_func = self.get_cur_func()
+                print(f"discovered a native to java edge: {(method, cur_func)}.")
                 record.add_invokee(method, cur_func)
         return_value = self.get_return_value(method)
         if return_value:

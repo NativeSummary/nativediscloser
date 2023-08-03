@@ -1,10 +1,12 @@
 import sys
+import os
 import re
 import logging
 import traceback
 from claripy import BVS
 from angr.sim_type import register_types, parse_type
 from angr.exploration_techniques import LengthLimiter
+import angr
 
 from . import JNI_PROCEDURES
 from .common import NotImplementedJNIFunction, JavaClass
@@ -15,8 +17,9 @@ from .record import Record, RecordNotFoundError
 JNI_LOADER = 'JNI_OnLoad'
 # value for "LengthLimiter" to limit the length of path a state goes through.
 # refer to: https://docs.angr.io/core-concepts/pathgroups
-MAX_LENGTH = 500000
-DYNAMIC_ANALYSIS_LENGTH = 100000
+MAX_LENGTH = int(os.getenv("MAX_LENGTH", '500000'))
+DYNAMIC_ANALYSIS_LENGTH = int(os.getenv("MAX_LENGTH", '100000'))
+DISBALE_LIMIT = os.getenv("DISBALE_LIMIT", 'false').lower() != 'false'
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -143,8 +146,15 @@ def get_prepared_jni_onload_state(proj, jvm_ptr, jenv_ptr, dex=None):
     jni_env_prepare_in_state(state, jvm_ptr, jenv_ptr, dex)
     return state
 
+import functools
+def add_coverage(subp_coverage, mgr): 
+    mgr = mgr # type: angr.sim_manager.SimulationManager
+    for state in mgr._fetch_states(angr.sim_manager.SimulationManager.ALL):
+        subp_coverage[hex(state.reg_concrete('ip'))] = 1
+    return mgr
 
-def analyze_jni_function(func_addr, proj, jvm_ptr, jenv_ptr, dex=None, returns=None, global_refs=None):
+def analyze_jni_function(func_addr, proj, jvm_ptr, jenv_ptr, dex=None, returns=None, global_refs=None, coverage=None):
+    import time; start = time.time()
     func_params, updates = get_jni_function_params(proj, func_addr, jenv_ptr)
     state = proj.factory.call_state(func_addr, *func_params)
     state.globals['func_ptr'] = func_addr
@@ -155,10 +165,16 @@ def analyze_jni_function(func_addr, proj, jvm_ptr, jenv_ptr, dex=None, returns=N
         state.globals[k] = v
     jni_env_prepare_in_state(state, jvm_ptr, jenv_ptr, dex)
     tech = LengthLimiter(MAX_LENGTH)
-    simgr = proj.factory.simgr(state)
-    simgr.use_technique(tech)
+    simgr = proj.factory.simgr(state) # type: angr.sim_manager.SimulationManager
+    if DISBALE_LIMIT:
+        logger.warning("Disabling length limiter.")
+    else:
+        simgr.use_technique(tech)
+    coverage_func = None
+    if coverage is not None:
+        coverage_func = functools.partial(add_coverage, coverage)
     try:
-        simgr.run()
+        simgr.run(step_func=coverage_func)
     except Exception as e:
         logger.warning(f'Analysis JNI function failed: {e}')
         traceback.print_exc()
@@ -168,12 +184,14 @@ def analyze_jni_function(func_addr, proj, jvm_ptr, jenv_ptr, dex=None, returns=N
         invokees = Record.RECORDS.get(func_addr).get_invokees()
         if invokees is not None:
             returns.update({func_addr: invokees})
-
+    duration = time.time() - start
+    logger.warning(f'Analysis spent: {duration}s.')
 
 def get_jni_function_params(proj, func_addr, jenv_ptr):
     record = Record.RECORDS.get(func_addr)
     if record is None:
         raise RecordNotFoundError('Relevant JNI function record not found!')
+    logger.warning(f'Current Function: {record}.')
     # for user's JNI function, the first 2 parameters are hidden from Java side
     # and the first one will always be the JNIEnv pointer.
     params = [jenv_ptr]
